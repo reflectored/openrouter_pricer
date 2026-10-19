@@ -1,0 +1,17 @@
+{
+  "name": "openrouter-pricer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pick an OpenRouter upstream provider and launch `ori pi` pinned to it.",
+  "bin": {
+    "orp": "./bin/orp"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "orp": "bun run src/index.ts"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.8.1"
+  }
+}
