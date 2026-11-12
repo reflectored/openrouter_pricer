@@ -503,7 +503,8 @@ function findProvider(rows: ProviderRow[], wanted: string): ProviderRow | undefi
 function launch(
   model: string,
   provider: ProviderRow,
-  opts: CliOptions
+  opts: CliOptions,
+  apiKey?: string
 ): number {
   const args = ["pi", "--model", model];
   if (opts.reasoningEffort) {
@@ -515,13 +516,20 @@ function launch(
     `Launching: ori ${args.join(" ")}\nPinned provider: ${provider.slug} (fallbacks: ${opts.allowFallbacks ? "on" : "off"})`
   );
 
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    OPENROUTER_PROVIDER_ORDER: provider.slug,
+    OPENROUTER_ALLOW_FALLBACKS: opts.allowFallbacks ? "1" : "0",
+  };
+
+  // Propagate the key orp resolved (flag, env, or OS keyring) so the child
+  // `ori` process can authenticate too. Without this a keyring-stored key is
+  // silently lost and `ori` refuses to start for lack of credentials.
+  if (apiKey) env.OPENROUTER_API_KEY = apiKey;
+
   const result = spawnSync("ori", args, {
     stdio: "inherit",
-    env: {
-      ...process.env,
-      OPENROUTER_PROVIDER_ORDER: provider.slug,
-      OPENROUTER_ALLOW_FALLBACKS: opts.allowFallbacks ? "1" : "0",
-    },
+    env,
   });
 
   if (result.error) {
@@ -641,7 +649,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const status = launch(model, chosen, opts);
+  const status = launch(model, chosen, opts, apiKey);
   process.exitCode = status;
 }
 
