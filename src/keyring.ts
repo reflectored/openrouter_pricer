@@ -46,6 +46,22 @@ export function keyringBackend(): KeyringBackend {
   return undefined;
 }
 
+/**
+ * Shell command that prints the stored key. Used for Pi's `auth.json` command
+ * sources (`"key": "!<command>"`), which fetch the secret on demand instead of
+ * exporting it into the environment.
+ */
+export function keyringLookupCommand(): string | undefined {
+  switch (keyringBackend()) {
+    case "secret-tool":
+      return `secret-tool lookup service ${SERVICE} account ${ACCOUNT}`;
+    case "keyring":
+      return `keyring get ${SERVICE} ${ACCOUNT}`;
+    default:
+      return undefined;
+  }
+}
+
 export function getKeyringKey(): string | undefined {
   const backend = keyringBackend();
   if (!backend) return undefined;

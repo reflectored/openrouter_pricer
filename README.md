@@ -59,6 +59,54 @@ The key can come from, in order:
 3. The OS keyring (`service=openrouter`, `account=orp-api-key`)
 4. An interactive hidden prompt, which saves it to the keyring when possible
 
+Before launching, `orp` authenticates ori itself:
+
+1. pipes the key to `ori login --with-key` (stdin, so it never lands in argv or
+   `ps`), which stores it in `~/.ori/credentials.json`;
+2. checks the result with `ori auth --json`;
+3. if that still reports no usable credential, runs
+   `ori auth --clear-workspace-choice` and checks again — a saved login choice
+   such as "use `OPENROUTER_API_KEY` from the environment" shadows the stored
+   key, which would otherwise be fatal below.
+
+The key is **never** placed in the environment of the `ori pi` child process:
+`orp` strips `OPENROUTER_API_KEY`, `OR_API_KEY`, and `OPENROUTER_KEY` from it,
+because anything the child inherits is readable by the agent running inside it
+(and ori prefers that variable over its stored credential). Pass
+`--no-ori-login` to skip the login step (ori then uses whatever credential it
+already has — including one from the environment, since only orp's child env is
+stripped).
+
+Stripping orp's child env is not enough on its own: `ori pi` re-exports the
+stored credential as `OPENROUTER_API_KEY` for the harness it launches, so the
+agent still saw the key in its own environment (verified: `ori auth` reports the
+encrypted store, yet `[ -n "$OPENROUTER_API_KEY" ]` is true inside the agent).
+The routing extension that orp already loads therefore deletes
+`OPENROUTER_API_KEY`, `OR_API_KEY`, and `OPENROUTER_KEY` from `process.env` when
+it is loaded and again on every provider request — before any agent tool call
+can spawn a process. Set `ORP_KEEP_KEY_ENV=1` to opt out (diagnostics only).
+
+Pi still needs a key to talk to OpenRouter, so orp points it at the keyring
+instead of the environment. Pi's `auth.json` accepts a command source
+(`docs/providers.md#load-an-api-key-from-a-command`), which Pi runs when the key
+is first needed and caches for the process lifetime:
+
+```json
+{
+  "openrouter": {
+    "type": "api_key",
+    "key": "!keyring get openrouter orp-api-key"
+  }
+}
+```
+
+`orp` writes that entry to `$PI_AGENT_DIR/auth.json` (default `~/.pi/agent`,
+mode `0600`), merging with whatever is already there; an OAuth credential is
+ever replaced. The command matches the keyring backend in use (`secret-tool
+lookup service openrouter account orp-api-key` or `keyring get openrouter
+orp-api-key`). Only if no backend can store the key does orp fall back to a
+plaintext entry, and it says so.
+
 ---
 
 ## Install
@@ -239,10 +287,15 @@ test -n "$(secret-tool lookup service openrouter account orp-api-key)" \
   && echo "key stored" || echo "no key"
 ```
 
-`orp` does not read Ori's SQLite credential stores. Ori's usable credential is
-either in the environment or in its encrypted login store. The plaintext
-`~/.ori/auth/plaintext/keys.sqlite` value found during development was not a
-usable bearer token.
+`orp` does not read Ori's SQLite credential stores. Instead it hands the key to
+ori with `ori login --with-key` (piped on stdin, see above) and confirms the
+result with `ori auth`; ori's own login store is what authenticates the launched
+session. The plaintext `~/.ori/auth/plaintext/keys.sqlite` value found during
+development was not a usable bearer token.
+
+Ori may warn that it could not reach `https://<region>.openrouter.ai/api/v1/key`
+to verify the key or save a region preference; the key is still stored (reported
+as "saved unverified") and this does not affect the launch.
 
 Security note: an unlocked GNOME keyring is readable by processes in your login
 session. Use a credit-limited OpenRouter key for `orp`.

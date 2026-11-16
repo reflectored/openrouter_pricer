@@ -4,7 +4,7 @@
  * `ori pi` with that provider pinned through a small Pi extension.
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   cancel,
@@ -25,6 +25,7 @@ import {
   keyringLocation,
   setKeyringKey,
 } from "./keyring.ts";
+import { ensurePiCredential } from "./pi-auth.ts";
 
 const DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 const ROUTING_EXTENSION = fileURLToPath(
@@ -44,6 +45,7 @@ interface CliOptions {
   json: boolean;
   noLaunch: boolean;
   noKeyring: boolean;
+  noOriLogin: boolean;
   yes: boolean;
   passthrough: string[];
 }
@@ -100,6 +102,7 @@ Model:
 Provider selection:
   --api-key <key>            OpenRouter key for the pricing API (throughput/latency)
   --no-keyring               Do not read/prompt the OS keyring
+  --no-ori-login             Do not run 'ori login --with-key' before launching
   --provider <slug>          Preselect provider, e.g. deepinfra (skips the picker)
   --sort price|tps|value     Ranking for the top 5 table (default: price)
   --no-fallback              Pass allow_fallbacks: false
@@ -134,6 +137,7 @@ function parseArgs(argv: string[]): CliOptions {
     json: false,
     noLaunch: false,
     noKeyring: false,
+    noOriLogin: false,
     yes: false,
     passthrough: [],
   };
@@ -194,6 +198,9 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       case "--no-keyring":
         opts.noKeyring = true;
+        break;
+      case "--no-ori-login":
+        opts.noOriLogin = true;
         break;
       case "--yes":
       case "-y":
@@ -500,12 +507,113 @@ function findProvider(rows: ProviderRow[], wanted: string): ProviderRow | undefi
   );
 }
 
-function launch(
+const KEY_ENV_VARS = [
+  "OPENROUTER_API_KEY",
+  "OR_API_KEY",
+  "OPENROUTER_KEY",
+] as const;
+
+/**
+ * Environment for every ori child process. The key is never part of it: an
+ * https://openrouter.ai/api/v1 `OPENROUTER_API_KEY` in the environment takes
+ * precedence over ori's stored credential, and everything a child inherits is
+ * readable by the agent running inside it.
+ */
+function oriEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, ...extra };
+  for (const name of KEY_ENV_VARS) delete env[name];
+  return env;
+}
+
+/**
+ * Hand the key to ori's own credential store (`~/.ori/credentials.json`).
+ * `ori login --with-key` takes no value: it reads the key from piped stdin, so
+ * the key never appears in argv/`ps` either.
+ *
+ * The key is written to the child's stdin explicitly rather than through
+ * `spawnSync({ input })`, which does not reliably reach the child under bun.
+ */
+function oriLogin(key: string): Promise<{ ok: boolean; detail?: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn("ori", ["login", "--with-key"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: oriEnv(),
+    });
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    child.on("error", reject);
+
+    const timer = setTimeout(() => child.kill(), 120_000);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const detail = (stderr.trim() || stdout.trim())
+        .split("\n")
+        .slice(-3)
+        .join(" ")
+        .slice(0, 400);
+      resolve({ ok: code === 0, detail: detail || undefined });
+    });
+
+    // ori reads the key as a single value from stdin; no trailing newline.
+    child.stdin?.on("error", () => undefined);
+    child.stdin?.end(key);
+  });
+}
+
+/** Forget a saved project-vs-stored login choice; deletes no keys. */
+function oriClearWorkspaceChoice(): void {
+  spawnSync("ori", ["auth", "--clear-workspace-choice"], {
+    stdio: "ignore",
+    timeout: 30_000,
+    env: oriEnv(),
+  });
+}
+
+/** Credential source as ori will see it, with the key env vars stripped. */
+function oriAuthStatus(): { authenticated: boolean; source?: string } | undefined {
+  const result = spawnSync("ori", ["auth", "--json"], {
+    stdio: ["ignore", "pipe", "pipe"],
+    encoding: "utf8",
+    timeout: 30_000,
+    env: oriEnv(),
+  });
+  if (result.error) throw result.error;
+
+  const raw = result.stdout ?? "";
+  const start = raw.indexOf("{");
+  const end = raw.lastIndexOf("}");
+  if (start !== -1 && end > start) {
+    try {
+      const body = JSON.parse(raw.slice(start, end + 1)) as {
+        data?: {
+          authenticated?: boolean;
+          source?: { kind?: string; location?: string };
+        };
+      };
+      return {
+        authenticated: Boolean(body.data?.authenticated),
+        source: body.data?.source?.location ?? body.data?.source?.kind,
+      };
+    } catch {
+      // fall through to the exit status below
+    }
+  }
+  return result.status === 0 ? { authenticated: true } : undefined;
+}
+
+async function launch(
   model: string,
   provider: ProviderRow,
   opts: CliOptions,
   apiKey?: string
-): number {
+): Promise<number> {
   const args = ["pi", "--model", model];
   if (opts.reasoningEffort) {
     args.push("--reasoning-effort", opts.reasoningEffort);
@@ -516,20 +624,57 @@ function launch(
     `Launching: ori ${args.join(" ")}\nPinned provider: ${provider.slug} (fallbacks: ${opts.allowFallbacks ? "on" : "off"})`
   );
 
-  const env: NodeJS.ProcessEnv = {
-    ...process.env,
-    OPENROUTER_PROVIDER_ORDER: provider.slug,
-    OPENROUTER_ALLOW_FALLBACKS: opts.allowFallbacks ? "1" : "0",
-  };
+  // Authenticate ori through its own login/credential store up front, so the
+  // key never has to exist in the environment the agent inherits.
+  if (apiKey && !opts.noOriLogin) {
+    const login = await oriLogin(apiKey);
+    if (login.ok) {
+      let status = oriAuthStatus();
 
-  // Propagate the key orp resolved (flag, env, or OS keyring) so the child
-  // `ori` process can authenticate too. Without this a keyring-stored key is
-  // silently lost and `ori` refuses to start for lack of credentials.
-  if (apiKey) env.OPENROUTER_API_KEY = apiKey;
+      // A saved login choice (e.g. "use the OPENROUTER_API_KEY environment
+      // variable") shadows the key we just stored, which is fatal here because
+      // that variable is stripped from the child. Forget the choice and re-check.
+      if (!status?.authenticated) {
+        oriClearWorkspaceChoice();
+        status = oriAuthStatus();
+      }
 
+      if (status?.authenticated) {
+        log.info(`ori auth: ok (credential source: ${status.source ?? "stored"})`);
+      } else {
+        log.warn(
+          "`ori login --with-key` succeeded, but `ori auth` still reports no usable credential"
+        );
+      }
+    } else {
+      log.warn(
+        `\`ori login --with-key\` failed; ori will use whatever credential it already has${
+          login.detail ? `\n  ori: ${login.detail}` : ""
+        }`
+      );
+    }
+  }
+
+  // The agent's own shell inherits Pi's environment, and the routing extension
+  // strips the key from it. Pi therefore needs a non-env credential source.
+  if (apiKey) {
+    const credential = ensurePiCredential(apiKey);
+    if (credential.ok) {
+      log.info(`pi credential: ${credential.detail}`);
+    } else {
+      log.warn(
+        `pi credential: ${credential.detail}\n  Pi may fail with "No API key found for openrouter".`
+      );
+    }
+  }
+
+  // The key reaches ori through its credential store, never through this env.
   const result = spawnSync("ori", args, {
     stdio: "inherit",
-    env,
+    env: oriEnv({
+      OPENROUTER_PROVIDER_ORDER: provider.slug,
+      OPENROUTER_ALLOW_FALLBACKS: opts.allowFallbacks ? "1" : "0",
+    }),
   });
 
   if (result.error) {
@@ -649,7 +794,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const status = launch(model, chosen, opts, apiKey);
+  const status = await launch(model, chosen, opts, apiKey);
   process.exitCode = status;
 }
 
